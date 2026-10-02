@@ -279,14 +279,12 @@ self.addEventListener('fetch', (event) => {
 				handleRemoteAccessRelayRequest(
 					event,
 					remoteAccessRelayMapping
-				).then((response) =>
-					applyCrossOriginIsolationHeaders(response, scope)
-				)
+				).then(applyCrossOriginIsolationHeaders)
 			);
 		}
 		return event.respondWith(
-			handleScopedRequest(event, scope).then((response) =>
-				applyCrossOriginIsolationHeaders(response, scope)
+			handleScopedRequest(event, scope).then(
+				applyCrossOriginIsolationHeaders
 			)
 		);
 	}
@@ -427,7 +425,9 @@ async function handleScopedRequest(event: FetchEvent, scope: string) {
 	const fullUrl = new URL(event.request.url);
 	const unscopedUrl = removeURLScope(fullUrl);
 	if (fullUrl.pathname.endsWith('/wp-includes/empty.html')) {
-		return emptyHtml(scope);
+		return emptyHtml(
+			fullUrl.searchParams.get('cross-origin-isolated') === '1'
+		);
 	}
 
 	const workerResponse = await convertFetchEventToPHPRequest(event);
@@ -564,18 +564,34 @@ reportServiceWorkerMetrics(self);
 const controlledIframe = `
 window.__playground_ControlledIframe = window.wp.element.forwardRef(function (props, ref) {
 	const source = window.wp.element.useMemo(function () {
+		let url;
 		if (props.srcDoc) {
 			// WordPress <= 6.2 uses a srcDoc that only contains a doctype.
-			return '/wp-includes/empty.html';
+			url = new URL('/wp-includes/empty.html', window.location.href);
 		} else if (props.src && props.src.startsWith('blob:')) {
-			// WordPress 6.3 uses a blob URL with doctype and a list of static assets.
+			// Newer WordPress versions use a blob URL with doctype and static assets.
 			// Pass the blob URL – never the document content – to empty.html, which
 			// fetches and renders it itself. Only same-origin blob: URLs are honored.
-			return '/wp-includes/empty.html#' + encodeURIComponent(props.src);
+			url = new URL('/wp-includes/empty.html', window.location.href);
+			url.hash = encodeURIComponent(props.src);
+		} else if (props.src) {
+			url = new URL(props.src, window.location.href);
+			if (
+				url.origin !== window.location.origin ||
+				!url.pathname.endsWith('/wp-includes/empty.html')
+			) {
+				return props.src;
+			}
 		} else {
-			// WordPress >= 6.4 uses a plain HTTPS URL that needs no correction.
 			return props.src;
 		}
+		// Carry the parent document's isolation state across service-worker restarts.
+		if (window.crossOriginIsolated) {
+			url.searchParams.set('cross-origin-isolated', '1');
+		} else {
+			url.searchParams.delete('cross-origin-isolated');
+		}
+		return url.href;
 	}, [props.src]);
 	return (
 		window.wp.element.createElement('iframe', {
@@ -624,16 +640,15 @@ const emptyHtmlScript = `
 /**
  * The empty HTML file loaded by the patched editor iframe.
  *
- * @param scope The scope of the request, used to determine whether cross-origin isolation is needed
+ * @param crossOriginIsolated Whether the parent document requires an isolated iframe
  */
-function emptyHtml(scope: string) {
+function emptyHtml(crossOriginIsolated: boolean) {
 	const headers: Record<string, string> = {
 		'content-type': 'text/html',
 	};
 
 	/**
-	 * Only add Document-Isolation-Policy when the parent page also has cross-origin
-	 * isolation headers (COEP/COOP that were rewritten to Document-Isolation-Policy).
+	 * Only add Document-Isolation-Policy when the parent document is isolated.
 	 *
 	 * Without this header in empty.html, Gutenberg fails to populate the editor iframe
 	 * with the editor markup when the editor page is loaded with COOP/COEP headers set.
@@ -642,7 +657,7 @@ function emptyHtml(scope: string) {
 	 * `isolate-and-credentialless` causes cross-origin requests to be sent without
 	 * credentials (cookies), resulting in "Session expired" errors.
 	 */
-	if (scopesWithCrossOriginIsolation.has(scope)) {
+	if (crossOriginIsolated) {
 		headers['Document-Isolation-Policy'] = 'isolate-and-credentialless';
 	}
 
@@ -727,13 +742,6 @@ async function getScopedWpDetails(scope: string): Promise<WPModuleDetails> {
  */
 let browserSupportsDocumentIsolationPolicy: boolean | undefined;
 
-/**
- * Scopes that have cross-origin isolation enabled (COEP headers were rewritten to
- * Document-Isolation-Policy). This is used to determine whether empty.html should
- * also have Document-Isolation-Policy header.
- */
-const scopesWithCrossOriginIsolation = new Set<string>();
-
 self.addEventListener('message', (event) => {
 	if (event.data?.type === 'document-isolation-policy-support-check') {
 		browserSupportsDocumentIsolationPolicy = event.data.supported === true;
@@ -745,12 +753,8 @@ self.addEventListener('message', (event) => {
  *
  * Handles two cases:
  *
- * 1. Response already carries `Document-Isolation-Policy`. This is what
- *    Gutenberg ≥ 22.6 / Gutenberg PR #75991 sends directly on editor screens in
- *    Chromium 137+. The response is left as-is, but the scope is tracked so
- *    that `empty.html` (the block editor's inner iframe) also receives DIP —
- *    parent and child frames need the same DIP for the editor to function
- *    (see https://github.com/WordPress/wordpress-playground/pull/3320).
+ * 1. Response already carries `Document-Isolation-Policy`. Gutenberg ≥ 22.6 sends
+ *    it directly on editor screens in Chromium 137+. The response is left as-is.
  *
  * 2. Response carries COEP/COOP (older Gutenberg, WordPress core's
  *    `wp_set_up_cross_origin_isolation`, or custom plugins). When the browser
@@ -760,18 +764,12 @@ self.addEventListener('message', (event) => {
  *    Playground.
  *
  * @param response The response to potentially modify
- * @param scope The scope of the request, used to track which scopes have cross-origin isolation
  * @returns A new Response with rewritten headers, or the original response if no changes are needed
  */
-function applyCrossOriginIsolationHeaders(
-	response: Response,
-	scope: string
-): Response {
-	// If the response already opts into DIP, track the scope so empty.html gets DIP too.
-	// This is the modern path once Gutenberg sends DIP directly — see
+function applyCrossOriginIsolationHeaders(response: Response): Response {
+	// Preserve the policy sent directly by Gutenberg.
 	// https://github.com/WordPress/gutenberg/pull/75991.
 	if (response.headers.has('document-isolation-policy')) {
-		scopesWithCrossOriginIsolation.add(scope);
 		return response;
 	}
 
@@ -824,10 +822,6 @@ function applyCrossOriginIsolationHeaders(
 	newHeaders.delete('cross-origin-embedder-policy');
 	newHeaders.delete('cross-origin-opener-policy');
 	newHeaders.set('document-isolation-policy', documentIsolationPolicy);
-
-	// Track that this scope has cross-origin isolation enabled so that
-	// empty.html (the editor iframe) can also get the Document-Isolation-Policy header.
-	scopesWithCrossOriginIsolation.add(scope);
 
 	return new Response(response.body, {
 		status: response.status,
